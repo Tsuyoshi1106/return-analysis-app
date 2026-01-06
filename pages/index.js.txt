@@ -1,0 +1,156 @@
+import { useEffect, useMemo, useState } from "react";
+import Papa from "papaparse";
+
+// analyze.jsのロジックをここに取り込む（まずはコピペでOK）
+function stddev(arr) {
+  const n = arr.length;
+  if (n < 2) return undefined;
+  const mean = arr.reduce((s, x) => s + x, 0) / n;
+  const varSum = arr.reduce((s, x) => s + (x - mean) * (x - mean), 0);
+  return Math.sqrt(varSum / (n - 1));
+}
+
+function worstNAvg(returns, n) {
+  if (returns.length < n) return undefined;
+  const a = [...returns].sort((x, y) => x - y);
+  const worst = a.slice(0, n);
+  return worst.reduce((s, x) => s + x, 0) / n;
+}
+
+function quantile(arr, q) {
+  if (!arr.length) throw new Error("Empty array");
+  if (q <= 0) return Math.min(...arr);
+  if (q >= 1) return Math.max(...arr);
+
+  const a = [...arr].sort((x, y) => x - y);
+  const pos = (a.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return a[base + 1] === undefined ? a[base] : a[base] + rest * (a[base + 1] - a[base]);
+}
+
+function analyze(closes) {
+  if (closes.length < 2) throw new Error("Need at least 2 prices");
+
+  const returns = [];
+  for (let i = 1; i < closes.length; i++) returns.push(closes[i] / closes[i - 1] - 1);
+
+  const equity = [1];
+  for (let i = 0; i < returns.length; i++) equity.push(equity[i] * (1 + returns[i]));
+
+  const drawdown = [];
+  let peak = equity[0];
+  let maxDrawdown = 0;
+  let ddDuration = 0;
+  let maxDdDuration = 0;
+
+  for (let i = 0; i < equity.length; i++) {
+    const e = equity[i];
+    if (e >= peak) {
+      peak = e;
+      ddDuration = 0;
+    } else {
+      ddDuration += 1;
+      if (ddDuration > maxDdDuration) maxDdDuration = ddDuration;
+    }
+    const dd = e / peak - 1;
+    drawdown.push(dd);
+    if (dd < maxDrawdown) maxDrawdown = dd;
+  }
+
+  let curLose = 0;
+  let maxLose = 0;
+  for (const r of returns) {
+    if (r < 0) {
+      curLose += 1;
+      if (curLose > maxLose) maxLose = curLose;
+    } else curLose = 0;
+  }
+
+  let worstYearLevelLoss = undefined;
+  if (returns.length >= 252) worstYearLevelLoss = quantile(returns, 1 / 252);
+
+  const dailyVol = stddev(returns);
+  const worst10Avg = worstNAvg(returns, 10);
+
+  return { returns, equity, drawdown, maxDrawdown, maxDdDuration, maxLosingStreak: maxLose, worstYearLevelLoss, dailyVol, worst10Avg };
+}
+
+export default function Home() {
+  const [ticker, setTicker] = useState("SAMPLE");
+  const [closes, setCloses] = useState([]);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    // まずは samples/crash_sample.csv を読み込む（UX優先でワンクリック動作）
+    // public に置く必要があるので、後でファイルを移す
+    fetch("/crash_sample.csv")
+      .then((r) => r.text())
+      .then((txt) => {
+        const parsed = Papa.parse(txt, { header: true, dynamicTyping: true, skipEmptyLines: true });
+        const arr = parsed.data.map((row) => row.close).filter((x) => Number.isFinite(x));
+        setCloses(arr);
+      })
+      .catch((e) => setErr(String(e)));
+  }, []);
+
+  const result = useMemo(() => {
+    try {
+      if (!closes.length) return null;
+      return analyze(closes);
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }, [closes]);
+
+  return (
+    <div style={{ maxWidth: 860, margin: "40px auto", padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
+      <h1 style={{ fontSize: 28, marginBottom: 8 }}>Return Risk Analyzer (MVP)</h1>
+      <div style={{ color: "#666", marginBottom: 24 }}>
+        予測なし・推奨なし。過去データから「痛み」と「揺れ」を可視化。
+      </div>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 20 }}>
+        <label style={{ width: 80 }}>Ticker</label>
+        <input value={ticker} onChange={(e) => setTicker(e.target.value)} style={{ padding: 10, width: 220 }} />
+        <button
+          onClick={() => alert("次はここで価格取得（API）に繋ぐ")}
+          style={{ padding: "10px 14px", cursor: "pointer" }}
+        >
+          Analyze
+        </button>
+      </div>
+
+      {err && <div style={{ color: "crimson" }}>{err}</div>}
+
+      {!result && <div>Loading sample data...</div>}
+
+      {result?.error && <div style={{ color: "crimson" }}>{result.error}</div>}
+
+      {result && !result.error && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+          <Card title="Max Drawdown" value={(result.maxDrawdown * 100).toFixed(1) + "%"} />
+          <Card title="Max DD Duration" value={result.maxDdDuration + " days"} />
+          <Card title="Max Losing Streak" value={result.maxLosingStreak + " days"} />
+          <Card title="Daily Vol (Std Dev)" value={fmtPct(result.dailyVol)} />
+          <Card title="Worst 10 Days Avg" value={fmtPct(result.worst10Avg) + " (need ≥10)"} />
+          <Card title="Year-level Worst Loss" value={fmtPct(result.worstYearLevelLoss) + " (need ≥252)"} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtPct(x) {
+  if (x === undefined || x === null || !Number.isFinite(x)) return "N/A";
+  return (x * 100).toFixed(2) + "%";
+}
+
+function Card({ title, value }) {
+  return (
+    <div style={{ border: "1px solid #ddd", borderRadius: 14, padding: 14 }}>
+      <div style={{ color: "#666", fontSize: 13, marginBottom: 8 }}>{title}</div>
+      <div style={{ fontSize: 22, fontWeight: 600 }}>{value}</div>
+    </div>
+  );
+}
