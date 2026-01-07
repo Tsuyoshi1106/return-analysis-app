@@ -11,6 +11,12 @@ import {
 
 /* ====== 数値計算ロジック ====== */
 
+function round(x, digits = 2) {
+  if (x === undefined || !Number.isFinite(x)) return x;
+  const m = 10 ** digits;
+  return Math.round(x * m) / m;
+}
+
 function stddev(arr) {
   const n = arr.length;
   if (n < 2) return undefined;
@@ -46,6 +52,7 @@ function analyze(points) {
 
   const closes = points.map((p) => p.close);
 
+  // returns[i] corresponds to points[i] date (i>=1)
   const returns = [];
   const retSeries = []; // {date, r}
   for (let i = 1; i < closes.length; i++) {
@@ -54,13 +61,15 @@ function analyze(points) {
     retSeries.push({ date: points[i].date, r });
   }
 
+  // equity (starts at 1)
   const equity = [1];
   for (let i = 0; i < returns.length; i++) {
     equity.push(equity[i] * (1 + returns[i]));
   }
 
+  // drawdown + durations
   let peak = equity[0];
-  let maxDD = 0;
+  let maxDD = 0; // <=0
   let ddDuration = 0;
   let maxDdDuration = 0;
 
@@ -77,6 +86,7 @@ function analyze(points) {
     return dd;
   });
 
+  // max losing streak
   let curLose = 0;
   let maxLose = 0;
   for (const r of returns) {
@@ -88,30 +98,46 @@ function analyze(points) {
     }
   }
 
+  // vol + tail proxies
   const dailyVol = stddev(returns);
   const worst10Avg = worstNAvg(returns, 10);
   const worstYear = returns.length >= 252 ? quantile(returns, 1 / 252) : undefined;
 
+  // charts (丸めて格納：見た目もtooltipも安定)
   const chart = points.map((p, i) => ({
     date: p.date,
-    equity: equity[i],
-    drawdown: drawdown[i] * 100,
+    equity: round(equity[i], 4),            // 例: 1.2345
+    drawdown: round(drawdown[i] * 100, 2),  // 例: -12.34 (%)
   }));
 
+  // worst days list (top 10 worst daily returns)
   const worstDays = [...retSeries]
-    .sort((a, b) => a.r - b.r)
+    .sort((a, b) => a.r - b.r) // worst first
     .slice(0, Math.min(10, retSeries.length))
     .map((x, idx) => ({
       rank: idx + 1,
       date: x.date,
-      retPct: x.r * 100,
+      retPct: round(x.r * 100, 2),
     }));
 
-  // Pain Score（ヒューリスティック）
+  // === Pain Score (Sigmora-style heuristic, 0-100) ===
+  // 深さ(MaxDD)・長さ(DD期間)・揺れ(日次ボラ)を、基準値で0-1に正規化して合成
+  // - depth : |MaxDD| / 0.60（60%DDを最大級の基準）
+  // - length: MaxDDDuration / 252（約1年を長い痛みの基準）
+  // - jitter: DailyVol / 0.03（3%日次ボラを激しい揺れの基準）
   const depth = clamp(Math.abs(maxDD) / 0.60, 0, 1);
   const length = clamp(maxDdDuration / 252, 0, 1);
   const jitter = dailyVol === undefined ? 0 : clamp(dailyVol / 0.03, 0, 1);
+
+  // weights: depth 55%, length 30%, jitter 15%
   const painScore = Math.round(100 * (0.55 * depth + 0.30 * length + 0.15 * jitter));
+
+  // 画面に説明を出すための内訳も返す（丸め）
+  const painBreakdown = {
+    depth: round(depth, 3),
+    length: round(length, 3),
+    jitter: round(jitter, 3),
+  };
 
   return {
     maxDD,
@@ -123,6 +149,7 @@ function analyze(points) {
     chart,
     worstDays,
     painScore,
+    painBreakdown,
   };
 }
 
@@ -133,12 +160,23 @@ function fmtPct(x) {
   return (x * 100).toFixed(2) + "%";
 }
 
+function fmtNum(x, digits = 2) {
+  if (x === undefined || !Number.isFinite(x)) return "N/A";
+  return Number(x).toFixed(digits);
+}
+
 function Card({ title, value, subtitle }) {
   return (
     <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
       <div style={{ color: "#666", fontSize: 13, marginBottom: 6 }}>{title}</div>
-      <div style={{ fontSize: 22, fontWeight: 650 }}>{value}</div>
-      {subtitle ? <div style={{ color: "#888", fontSize: 12, marginTop: 6 }}>{subtitle}</div> : null}
+      <div style={{ fontSize: 22, fontWeight: 650, wordBreak: "break-word" }}>
+        {value}
+      </div>
+      {subtitle ? (
+        <div style={{ color: "#888", fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
+          {subtitle}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -189,6 +227,9 @@ export default function Home() {
   const [showWorst, setShowWorst] = useState(true);
   const [autoRan, setAutoRan] = useState(false);
 
+  // SSRで window を触らないように share URL を state に持つ
+  const [shareUrl, setShareUrl] = useState("");
+
   const result = useMemo(() => {
     if (!points.length) return null;
     return analyze(points);
@@ -225,29 +266,57 @@ export default function Home() {
     const nextT = params.ticker || "GLD";
     const nextP = params.period || "5Y";
 
-    // state反映してから走らせる
     setTicker(nextT);
     setPeriod(nextP);
     setAutoRan(true);
 
-    // URLは既にその値なので updateURL=false でOK
     onAnalyze(nextT, nextP, { updateURL: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRan]);
 
+  // share URL を更新（クライアントでのみ）
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const origin = window.location.origin;
+    const path = `/?ticker=${encodeURIComponent(
+      ticker.toUpperCase().trim()
+    )}&period=${encodeURIComponent(period.toUpperCase().trim())}`;
+    setShareUrl(origin + path);
+  }, [ticker, period]);
+
   return (
-    <div style={{ maxWidth: 1000, margin: "40px auto", padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
+    <div
+      style={{
+        maxWidth: 1000,
+        margin: "40px auto",
+        padding: 16,
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto",
+      }}
+    >
       <h1 style={{ marginBottom: 6 }}>Return Risk Analyzer (MVP)</h1>
       <div style={{ color: "#666", marginBottom: 18 }}>
         予測なし・推奨なし。過去データから「痛み」と「揺れ」を可視化。
       </div>
 
-      <div style={{ display: "flex", gap: 12, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          marginBottom: 14,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
         <input
           value={ticker}
           onChange={(e) => setTicker(e.target.value)}
           placeholder="Ticker (e.g., GLD)"
-          style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", width: 180 }}
+          style={{
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            width: 180,
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter") onAnalyze();
           }}
@@ -287,13 +356,13 @@ export default function Home() {
         </div>
       </div>
 
-      <div style={{ color: "#888", fontSize: 12, marginBottom: 14 }}>
-        共有：URL に <code>?ticker=GLD&period=5Y</code> を付けると、その条件で自動分析します。
+      <div style={{ color: "#888", fontSize: 12, marginBottom: 14, lineHeight: 1.6 }}>
+        共有：URL に <code>?ticker=GLD&amp;period=5Y</code> を付けると、その条件で自動分析します。
+        <br />
+        ※グラフの数値は「見やすさ優先」で四捨五入しています（Equity: 小数4桁、DD%: 小数2桁）。
       </div>
 
-      {err ? (
-        <div style={{ color: "crimson", marginBottom: 10 }}>{err}</div>
-      ) : null}
+      {err ? <div style={{ color: "crimson", marginBottom: 10 }}>{err}</div> : null}
 
       {result && (
         <>
@@ -308,7 +377,14 @@ export default function Home() {
             <Card
               title="Pain Score"
               value={`${result.painScore}/100`}
-              subtitle="MaxDD・DD期間・日次ボラのヒューリスティック合成（予測ではない）"
+              subtitle={
+                "過去の「痛み」の要約（将来予測ではない）。\n" +
+                "深さ=|MaxDD|/0.60、長さ=DD期間/252、揺れ=日次ボラ/0.03 を 0-1 に正規化して合成。\n" +
+                `内訳: depth=${fmtNum(result.painBreakdown.depth, 3)}, length=${fmtNum(
+                  result.painBreakdown.length,
+                  3
+                )}, jitter=${fmtNum(result.painBreakdown.jitter, 3)}`
+              }
             />
             <Card title="Max Drawdown" value={fmtPct(result.maxDD)} />
             <Card title="Max DD Duration" value={`${result.maxDdDuration} days`} />
@@ -316,11 +392,7 @@ export default function Home() {
             <Card title="Daily Volatility" value={fmtPct(result.dailyVol)} />
             <Card title="Worst 10 Days Avg" value={fmtPct(result.worst10Avg)} />
             <Card title="Year-level Worst Loss" value={fmtPct(result.worstYear)} subtitle="データが少ないとN/A" />
-            <Card
-              title="Share this"
-              value={`${window.location.pathname}?ticker=${ticker.toUpperCase()}&period=${period.toUpperCase()}`}
-              subtitle="URLパラメータで同じ分析を再現"
-            />
+            <Card title="Share this URL" value={shareUrl || "Loading..."} subtitle="同じ分析条件を再現" />
             <Card title="Worst days list" value={showWorst ? "ON" : "OFF"} subtitle="トグルで表示切替" />
           </div>
 
@@ -329,8 +401,8 @@ export default function Home() {
             <LineChart data={result.chart}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="date" hide />
-              <YAxis />
-              <Tooltip />
+              <YAxis tickFormatter={(v) => Number(v).toFixed(4)} />
+              <Tooltip formatter={(v) => Number(v).toFixed(4)} />
               <Line type="monotone" dataKey="equity" dot={false} />
             </LineChart>
           </ResponsiveContainer>
@@ -340,8 +412,8 @@ export default function Home() {
             <LineChart data={result.chart}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="date" hide />
-              <YAxis />
-              <Tooltip />
+              <YAxis tickFormatter={(v) => Number(v).toFixed(2)} />
+              <Tooltip formatter={(v) => `${Number(v).toFixed(2)}%`} />
               <Line type="monotone" dataKey="drawdown" dot={false} />
             </LineChart>
           </ResponsiveContainer>
@@ -384,8 +456,8 @@ export default function Home() {
                   ))}
                 </tbody>
               </table>
-              <div style={{ color: "#888", fontSize: 12, marginTop: 8 }}>
-                Worst days は「その日（終値ベース）のリターン」が最も悪い日付を並べています。
+              <div style={{ color: "#888", fontSize: 12, marginTop: 8, lineHeight: 1.6 }}>
+                Worst days は「その日（終値ベース）のリターン」が最も悪い日付を並べています（四捨五入表示）。
               </div>
             </div>
           )}
