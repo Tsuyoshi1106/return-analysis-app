@@ -1,136 +1,68 @@
 // web/pages/api/silver-premium.js
-// Silver Premium Monitor (US vs SGE SHAG)
-// Data sources:
-// - SGE: https://en.sge.com.cn/h5_data_SilverBenchmarkPrice (table page)  (more scrape-friendly)
-// - Yahoo Finance (no key): SI=F (COMEX silver futures), USD/CNY
 //
-// Premium% = (SGE_SHAG_CNY/kg * scale) / (SI=F_USD/oz * USD/CNY * 32.1507466) - 1
+// SATAN (shortest) working version: NO SGE scraping.
+// We use Yahoo Finance only (stable on Vercel):
+// - US silver proxy: SI=F (USD/oz)
+// - "China proxy": AG=F (USD/oz)  ※not actual China spot; proxy series
+// - FX: USDCNY=X (USD/CNY)
 //
-// Notes:
-// - This is an educational/analytics tool; not investment advice.
-// - If SGE page structure changes, regex may need an update.
+// Premium% = (ChinaProxy_USD/oz * USD/CNY * 32.1507) / (US_USD/oz * USD/CNY * 32.1507) - 1
+//         = ChinaProxy_USD/oz / US_USD/oz - 1
+//
+// (We still include FX + kg conversion in output for transparency.)
 
-const OZ_TO_KG = 32.1507466;
+const OZ_PER_KG = 32.1507466;
 
-function periodToDays(period) {
-  switch ((period || "1Y").toUpperCase()) {
-    case "1M":
-      return 35;
-    case "3M":
-      return 110;
-    case "6M":
-      return 220;
-    case "1Y":
-      return 400;
-    case "5Y":
-      return 2000;
-    default:
-      return 400;
-  }
+function mapPeriod(period) {
+  const p = String(period || "1Y").toUpperCase();
+  // choose ranges that are robust
+  if (p === "1M") return { range: "3mo", interval: "1d", days: 40 };
+  if (p === "3M") return { range: "6mo", interval: "1d", days: 120 };
+  if (p === "6M") return { range: "1y", interval: "1d", days: 250 };
+  if (p === "5Y") return { range: "5y", interval: "1wk", days: 2000 };
+  return { range: "2y", interval: "1d", days: 450 }; // 1Y default
 }
 
-function yRange(period) {
-  switch ((period || "1Y").toUpperCase()) {
-    case "1M":
-      return { range: "2mo", interval: "1d" };
-    case "3M":
-      return { range: "6mo", interval: "1d" };
-    case "6M":
-      return { range: "1y", interval: "1d" };
-    case "1Y":
-      return { range: "2y", interval: "1d" };
-    case "5Y":
-      return { range: "5y", interval: "1wk" };
-    default:
-      return { range: "2y", interval: "1d" };
-  }
-}
-
-async function fetchYahooChart(symbol, range, interval) {
+async function fetchYahooDailyCloses(symbol, range, interval) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     symbol
-  )}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(
-    interval
-  )}&includePrePost=false&events=div%7Csplit%7CcapitalGains`;
+  )}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
 
-  const res = await fetch(url, {
+  const r = await fetch(url, {
     headers: {
-      // Some hosts behave better with a UA
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
       Accept: "application/json,text/plain,*/*",
     },
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Yahoo fetch failed: ${symbol} ${res.status} ${text.slice(0, 120)}`);
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`Yahoo fetch failed: ${symbol} ${r.status} ${t.slice(0, 120)}`);
   }
 
-  const json = await res.json();
-  const result = json?.chart?.result?.[0];
-  if (!result) throw new Error(`Yahoo response missing chart.result for ${symbol}`);
+  const j = await r.json();
+  const res = j?.chart?.result?.[0];
+  if (!res) throw new Error(`Yahoo response missing chart.result for ${symbol}`);
 
-  const ts = result.timestamp || [];
-  const quotes = result.indicators?.quote?.[0] || {};
-  const close = quotes.close || [];
+  const ts = res.timestamp || [];
+  const close = res.indicators?.quote?.[0]?.close || [];
 
-  // Build [ {date, value} ] using close
-  const points = [];
+  const out = [];
   for (let i = 0; i < ts.length; i++) {
-    const v = close[i];
-    if (v == null || Number.isNaN(v)) continue;
+    const c = close[i];
+    if (c == null || Number.isNaN(c)) continue;
     const d = new Date(ts[i] * 1000);
     const iso = d.toISOString().slice(0, 10);
-    points.push({ date: iso, value: Number(v) });
+    out.push({ date: iso, close: Number(c) });
   }
-  return points;
+  return out;
 }
 
-function parseSgeH5Table(html) {
-  // Target rows like:
-  // <tr> <td>20260112</td> <td>SHAG</td> <td>20421</td> <td>20927</td> </tr>
-  //
-  // We'll accept extra attributes/whitespace.
-  const rows = [];
-
-  const rowRe =
-    /<tr[^>]*>\s*<td[^>]*>\s*(\d{8})\s*<\/td>\s*<td[^>]*>\s*SHAG\s*<\/td>\s*<td[^>]*>\s*([\d.]+)\s*<\/td>\s*<td[^>]*>\s*([\d.]+)\s*<\/td>/gi;
-
-  let m;
-  while ((m = rowRe.exec(html)) !== null) {
-    const yyyymmdd = m[1];
-    const am = Number(m[2]);
-    const pm = Number(m[3]);
-    const iso = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
-
-    // Prefer PM if present, else AM
-    const price = Number.isFinite(pm) && pm > 0 ? pm : am;
-
-    if (Number.isFinite(price) && price > 0) {
-      rows.push({ date: iso, shag_cny_kg: price, am, pm });
-    }
-  }
-
-  // If the table is rendered in a less-HTML-ish way (rare), try a fallback:
-  // "20260112, SHAG, 20421, 20927" style
-  if (rows.length === 0) {
-    const altRe = /(\d{8})\s*,?\s*SHAG\s*,?\s*([\d.]+)\s*,?\s*([\d.]+)/g;
-    while ((m = altRe.exec(html)) !== null) {
-      const yyyymmdd = m[1];
-      const am = Number(m[2]);
-      const pm = Number(m[3]);
-      const iso = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
-      const price = Number.isFinite(pm) && pm > 0 ? pm : am;
-      if (Number.isFinite(price) && price > 0) {
-        rows.push({ date: iso, shag_cny_kg: price, am, pm });
-      }
-    }
-  }
-
-  // sort asc
-  rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-  return rows;
+function buildMap(series) {
+  const m = new Map();
+  for (const x of series) m.set(x.date, x.close);
+  return m;
 }
 
 function filterRecent(points, days) {
@@ -140,105 +72,75 @@ function filterRecent(points, days) {
   return points.filter((p) => new Date(p.date) >= cutoff);
 }
 
-function buildMap(points) {
-  const m = new Map();
-  for (const p of points) m.set(p.date, p.value);
-  return m;
-}
-
 export default async function handler(req, res) {
   try {
-    const period = (req.query.period || "1Y").toString();
-    const scale = Number(req.query.scale ?? "1");
+    const period = String(req.query.period || "1Y");
+    const scale = Number(req.query.scale ?? 1); // keep for UI compatibility (unused effectively)
     const scaleSafe = Number.isFinite(scale) && scale > 0 ? scale : 1;
 
-    const { range, interval } = yRange(period);
-    const days = periodToDays(period);
+    const { range, interval, days } = mapPeriod(period);
 
-    // 1) SGE SHAG (CNY/kg)
-    // Use the H5 table page (more scrape-friendly).
-    const sgeUrl = "https://en.sge.com.cn/h5_data_SilverBenchmarkPrice";
-    const sgeRes = await fetch(sgeUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-
-    if (!sgeRes.ok) {
-      const text = await sgeRes.text().catch(() => "");
-      throw new Error(`SGE fetch failed: ${sgeRes.status} ${text.slice(0, 120)}`);
-    }
-
-    const sgeHtml = await sgeRes.text();
-    let shag = parseSgeH5Table(sgeHtml);
-    shag = filterRecent(shag, days);
-
-    if (!shag.length) {
-      throw new Error(
-        "Could not parse SHAG data from SGE h5 page. The page structure may have changed or blocked."
-      );
-    }
-
-    // 2) Yahoo: SI=F (USD/oz), USD/CNY
-    const [si, usdcny] = await Promise.all([
-      fetchYahooChart("SI=F", range, interval),
-      fetchYahooChart("USDCNY=X", range, interval),
+    // Yahoo only
+    // US proxy: SI=F
+    // "China proxy": AG=F
+    // FX: USDCNY=X
+    const [us, cnProxy, fx] = await Promise.all([
+      fetchYahooDailyCloses("SI=F", range, interval),
+      fetchYahooDailyCloses("AG=F", range, interval),
+      fetchYahooDailyCloses("USDCNY=X", range, interval),
     ]);
 
-    const siMap = buildMap(si);
-    const fxMap = buildMap(usdcny);
+    const usMap = buildMap(us);
+    const cnMap = buildMap(cnProxy);
+    const fxMap = buildMap(fx);
 
-    // 3) Join on dates present in SGE, require SI and FX
-    const points = [];
-    for (const p of shag) {
-      const siUsdOz = siMap.get(p.date);
-      const fx = fxMap.get(p.date);
-      if (siUsdOz == null || fx == null) continue;
+    // join on intersection
+    const dates = [...usMap.keys()].filter((d) => cnMap.has(d) && fxMap.has(d)).sort();
 
-      const us_cny_kg = Number(siUsdOz) * Number(fx) * OZ_TO_KG;
-      if (!Number.isFinite(us_cny_kg) || us_cny_kg <= 0) continue;
+    let points = [];
+    for (const d of dates) {
+      const usUsdOz = usMap.get(d);
+      const cnUsdOz = cnMap.get(d);
+      const usdCny = fxMap.get(d);
+      if (![usUsdOz, cnUsdOz, usdCny].every((v) => Number.isFinite(v) && v > 0)) continue;
 
-      const sge_cny_kg = p.shag_cny_kg * scaleSafe;
-      const premium = sge_cny_kg / us_cny_kg - 1;
+      // Convert to CNY/kg for display (not required for premium calc)
+      const usCnyKg = usUsdOz * usdCny * OZ_PER_KG;
+      const cnCnyKg = cnUsdOz * usdCny * OZ_PER_KG * scaleSafe;
 
+      const premium = cnCnyKg / usCnyKg - 1; // == cnUsdOz/usUsdOz - 1 (scale cancels if same units)
       points.push({
-        date: p.date,
-        sge_cny_kg: Number(sge_cny_kg),
-        us_cny_kg: Number(us_cny_kg),
-        premium: Number(premium),
-        si_usd_oz: Number(siUsdOz),
-        usdcny: Number(fx),
+        date: d,
+        us_usd_oz: usUsdOz,
+        cn_proxy_usd_oz: cnUsdOz,
+        usd_cny: usdCny,
+        us_cny_kg: usCnyKg,
+        cn_proxy_cny_kg: cnCnyKg,
+        premium: premium, // decimal
       });
     }
 
-    if (!points.length) {
-      throw new Error("No joined data points (dates did not overlap).");
-    }
+    points = filterRecent(points, days);
 
-    // cache a bit (helps avoid rate limiting)
-    res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate=86400");
-    res.status(200).json({
+    if (!points.length) throw new Error("No joined data points (symbols/overlap).");
+
+    res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate=86400");
+    return res.status(200).json({
       ok: true,
       period,
       scale: scaleSafe,
-      n: points.length,
       source: {
-        sge: sgeUrl,
-        yahoo: ["SI=F", "USDCNY=X"],
+        yahoo_symbols: { us: "SI=F", cn_proxy: "AG=F", fx: "USDCNY=X" },
+        note:
+          "This SATAN version uses Yahoo-only proxies (no SGE scraping). CN proxy is AG=F on Yahoo (not guaranteed to be SGE spot).",
       },
       points,
     });
   } catch (e) {
-    const msg = e?.message || String(e);
-
-    res.status(502).json({
+    return res.status(502).json({
       ok: false,
-      error: msg,
-      hint:
-        "Common causes: SGE page changed/blocked, rate limits, or no overlap in dates. Try again later or reduce period.",
+      error: String(e?.message || e),
+      hint: "Try again later (rate limits) or shorten period.",
     });
   }
 }

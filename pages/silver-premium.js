@@ -1,220 +1,176 @@
 // web/pages/silver-premium.js
 import { useMemo, useState } from "react";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-} from "recharts";
 
-function round(x, digits = 2) {
-  if (x === undefined || x === null || !Number.isFinite(x)) return x;
-  const m = 10 ** digits;
-  return Math.round(x * m) / m;
-}
-
-function Card({ title, value, subtitle }) {
-  return (
-    <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
-      <div style={{ color: "#666", fontSize: 13, marginBottom: 6 }}>{title}</div>
-      <div style={{ fontSize: 22, fontWeight: 650, wordBreak: "break-word" }}>
-        {value}
-      </div>
-      {subtitle ? (
-        <div style={{ color: "#888", fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-          {subtitle}
-        </div>
-      ) : null}
-    </div>
-  );
+function round(x, d = 3) {
+  if (x == null || !Number.isFinite(x)) return x;
+  const p = Math.pow(10, d);
+  return Math.round(x * p) / p;
 }
 
 export default function SilverPremium() {
-  const [range, setRange] = useState("1y");
-  const [sgeScale, setSgeScale] = useState("1");
+  const [period, setPeriod] = useState("1Y");
+  const [scale, setScale] = useState("1");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [data, setData] = useState(null);
 
-  const chartPremium = useMemo(() => {
-    if (!data?.points?.length) return [];
-    return data.points.map((p) => ({
-      date: p.date,
-      premium_pct: round(p.premium_pct, 2),
-    }));
-  }, [data]);
+  const points = data?.points || [];
 
-  const chartLevels = useMemo(() => {
-    if (!data?.points?.length) return [];
-    return data.points.map((p) => ({
-      date: p.date,
-      shag_cny_per_kg: round(p.shag_cny_per_kg, 2),
-      implied_cny_per_kg: round(p.implied_cny_per_kg, 2),
-    }));
-  }, [data]);
+  const summary = useMemo(() => {
+    if (!points.length) return null;
+    const last = points[points.length - 1];
+    return {
+      date: last.date,
+      premiumPct: last.premium * 100,
+      usUsd: last.us_usd_oz,
+      cnUsd: last.cn_proxy_usd_oz,
+      fx: last.usd_cny,
+      usCnyKg: last.us_cny_kg,
+      cnCnyKg: last.cn_proxy_cny_kg,
+    };
+  }, [points]);
 
-  async function onLoad() {
-    setErr("");
+  async function load() {
     setLoading(true);
+    setErr("");
+    setData(null);
     try {
-      const url = `/api/silver-premium?range=${encodeURIComponent(
-        range
-      )}&sgeScale=${encodeURIComponent(sgeScale)}`;
-      const r = await fetch(url);
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || "API error");
-      setData(j);
+      const url = `/api/silver-premium?period=${encodeURIComponent(
+        period
+      )}&scale=${encodeURIComponent(scale)}`;
+      const res = await fetch(url);
+      const json = await res.json();
+      if (!res.ok || !json.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+      setData(json);
     } catch (e) {
-      setErr(String(e?.message || e));
+      setErr(e?.message || String(e));
     } finally {
       setLoading(false);
     }
   }
 
-  const latest = data?.stats?.latest;
-
   return (
     <div
       style={{
-        maxWidth: 1050,
+        maxWidth: 980,
         margin: "40px auto",
-        padding: 16,
+        padding: "0 18px",
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto",
       }}
     >
-      <h1 style={{ marginBottom: 6 }}>Silver Premium Monitor (US vs SGE SHAG)</h1>
-      <div style={{ color: "#666", marginBottom: 18 }}>
-        SGE（上海銀ベンチ SHAG）と、米国（SI=F）×USD/CNY から計算した「US暗黙CNY/kg」との
-        差（Premium%）を可視化します。予測・推奨はしません。
-      </div>
+      <h1 style={{ marginBottom: 6 }}>Silver Premium Monitor (Proxy version)</h1>
+      <p style={{ marginTop: 0, color: "#444" }}>
+        中国側の現物データはサーバ側で取得が不安定なため、最短版では Yahoo のプロキシ（AG=F）を使って
+        「差（Premium%）」を可視化します。予測・推奨はしません。
+      </p>
 
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-        <select
-          value={range}
-          onChange={(e) => setRange(e.target.value)}
-          style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd" }}
-        >
-          <option value="1y">1Y</option>
-          <option value="2y">2Y</option>
-          <option value="5y">5Y</option>
-          <option value="max">MAX</option>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginTop: 18 }}>
+        <select value={period} onChange={(e) => setPeriod(e.target.value)} style={{ padding: "10px 12px" }}>
+          <option value="1M">1M</option>
+          <option value="3M">3M</option>
+          <option value="6M">6M</option>
+          <option value="1Y">1Y</option>
+          <option value="5Y">5Y</option>
         </select>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <label style={{ fontSize: 12, color: "#666" }}>
-            SGE scale（単位ズレ調整）
-          </label>
+          <div style={{ fontSize: 12, color: "#555" }}>scale（互換用 / 基本1）</div>
           <input
-            value={sgeScale}
-            onChange={(e) => setSgeScale(e.target.value)}
+            value={scale}
+            onChange={(e) => setScale(e.target.value)}
             placeholder="1"
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              width: 180,
-            }}
+            style={{ padding: "10px 12px", width: 240 }}
           />
         </div>
 
         <button
-          onClick={onLoad}
+          onClick={load}
           disabled={loading}
           style={{
-            padding: "10px 14px",
-            borderRadius: 10,
+            padding: "12px 18px",
             border: "1px solid #111",
             background: "#111",
             color: "white",
+            borderRadius: 8,
             cursor: loading ? "not-allowed" : "pointer",
-            opacity: loading ? 0.7 : 1,
-            height: 42,
-            marginTop: 18,
           }}
         >
           {loading ? "Loading..." : "Load"}
         </button>
       </div>
 
-      <div style={{ color: "#888", fontSize: 12, marginTop: 10, lineHeight: 1.6 }}>
-        Premium% = (SGE_SHAG_CNY/kg * scale) / (SI=F_USD/oz × USD/CNY × 32.1507) − 1<br />
-        ※ SGE側の公表単位がページ側の都合で解釈しづらい場合があるため、MVPでは scale を設けています。
-        レベル感が明らかにズレる場合は 0.1 / 0.01 などを試してください。
-      </div>
+      <p style={{ marginTop: 14, color: "#666", fontSize: 13, lineHeight: 1.6 }}>
+        Premium% = (CN proxy / US) − 1（※内部的にはCNY/kg換算も表示）
+        <br />
+        Symbols: US=SI=F, CN proxy=AG=F, FX=USDCNY=X（Yahoo）
+      </p>
 
-      {err ? <div style={{ color: "crimson", marginTop: 12 }}>{err}</div> : null}
+      {err ? (
+        <div style={{ marginTop: 18 }}>
+          <div style={{ color: "crimson", fontWeight: 600 }}>Error: {err}</div>
+          <div style={{ marginTop: 6, color: "#666", fontSize: 13 }}>
+            よくある原因：Yahoo側の一時レート制限・ネットワーク・シンボル取得失敗
+          </div>
+        </div>
+      ) : null}
 
-      {data && latest && (
-        <>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-              gap: 12,
-              marginTop: 18,
-              marginBottom: 18,
-            }}
-          >
-            <Card
-              title="Latest Premium"
-              value={`${round(latest.premium_pct, 2)}%`}
-              subtitle={`Date: ${latest.date}`}
-            />
-            <Card
-              title="Z-score (vs history)"
-              value={
-                latest.zscore === null || latest.zscore === undefined
-                  ? "N/A"
-                  : round(latest.zscore, 2)
-              }
-              subtitle={`Mean=${round(data.stats.mean_premium_pct, 2)}%, Std=${round(
-                data.stats.std_premium_pct,
-                2
-              )}%`}
-            />
-            <Card
-              title="Levels (CNY/kg)"
-              value={`${round(latest.shag_cny_per_kg, 2)} vs ${round(
-                latest.implied_cny_per_kg,
-                2
-              )}`}
-              subtitle="SGE_SHAG (scaled) vs US implied"
-            />
+      {summary ? (
+        <div style={{ marginTop: 18, padding: 14, border: "1px solid #ddd", borderRadius: 10 }}>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Latest</div>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap", color: "#222" }}>
+            <div>Date: {summary.date}</div>
+            <div>Premium: {round(summary.premiumPct, 2)}%</div>
+            <div>US (SI=F): {round(summary.usUsd, 2)} USD/oz</div>
+            <div>CN proxy (AG=F): {round(summary.cnUsd, 2)} USD/oz</div>
+            <div>USD/CNY: {round(summary.fx, 4)}</div>
+            <div>US: {round(summary.usCnyKg, 0)} CNY/kg</div>
+            <div>CN proxy: {round(summary.cnCnyKg, 0)} CNY/kg</div>
+          </div>
+        </div>
+      ) : null}
+
+      {points.length ? (
+        <div style={{ marginTop: 18 }}>
+          <h3 style={{ marginBottom: 8 }}>Data (last 120 rows, rounded)</h3>
+          <div style={{ overflowX: "auto", border: "1px solid #eee", borderRadius: 10 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: "#fafafa" }}>
+                  <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #eee" }}>Date</th>
+                  <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #eee" }}>Premium%</th>
+                  <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #eee" }}>US (USD/oz)</th>
+                  <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #eee" }}>CN proxy (USD/oz)</th>
+                  <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #eee" }}>USD/CNY</th>
+                </tr>
+              </thead>
+              <tbody>
+                {points.slice(-120).map((p) => (
+                  <tr key={p.date}>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0" }}>{p.date}</td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0", textAlign: "right" }}>
+                      {round(p.premium * 100, 2)}%
+                    </td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0", textAlign: "right" }}>
+                      {round(p.us_usd_oz, 2)}
+                    </td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0", textAlign: "right" }}>
+                      {round(p.cn_proxy_usd_oz, 2)}
+                    </td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0", textAlign: "right" }}>
+                      {round(p.usd_cny, 4)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
 
-          <h3 style={{ marginTop: 6 }}>Premium (%)</h3>
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={chartPremium}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="date" hide />
-              <YAxis tickFormatter={(v) => Number(v).toFixed(2)} />
-              <Tooltip formatter={(v) => `${Number(v).toFixed(2)}%`} />
-              <Line type="monotone" dataKey="premium_pct" dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-
-          <h3 style={{ marginTop: 26 }}>Level comparison (CNY/kg)</h3>
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={chartLevels}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="date" hide />
-              <YAxis tickFormatter={(v) => Number(v).toFixed(0)} />
-              <Tooltip formatter={(v) => Number(v).toFixed(2)} />
-              <Line type="monotone" dataKey="shag_cny_per_kg" dot={false} />
-              <Line type="monotone" dataKey="implied_cny_per_kg" dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-
-          <div style={{ marginTop: 22, fontSize: 12, color: "#888", lineHeight: 1.6 }}>
-            注意：このツールは分析目的であり、投資助言ではありません。将来の裁定機会や収束を保証しません。
-          </div>
-        </>
-      )}
+          <p style={{ marginTop: 10, color: "#777", fontSize: 12 }}>
+            注意：このツールは教育・分析目的であり、投資助言ではありません。将来の成果を保証しません。
+          </p>
+        </div>
+      ) : null}
     </div>
   );
 }
-
 
